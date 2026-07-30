@@ -1,0 +1,14 @@
+{
+    "enable": false,
+    "host": "http://clouddrive.local:19798",
+    "username": "your-username",
+    "password": "change-me",
+    "target_dir": "",
+    "offline_dir": "/115/anime",
+    "stall_time": 60,
+    "stall_min_speed": 1,
+    "scan_interval": 300,
+    "local_path": "/cd2-offline",
+    "pause_qb_torrent": true,
+    "resume_after_recheck": true
+}

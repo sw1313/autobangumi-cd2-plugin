@@ -1,0 +1,27 @@
+{
+  "config": {
+    "cd2_set": {
+      "title": "CloudDrive2 离线下载",
+      "desc": "qB 卡种时自动提交 115 离线下载，完成后同步回 qB 做种。",
+      "enable": "启用 CD2 回退",
+      "host": "CD2 地址",
+      "username": "用户名",
+      "password": "密码",
+      "offline_dir": "115 云盘离线路径",
+      "local_path": "本地同步目录",
+      "stall_time": "卡种判定（分钟）",
+      "stall_min_speed": "最低速度（KB/s）",
+      "scan_interval": "扫描间隔（秒）",
+      "pause_qb_torrent": "提交前暂停 qB 任务",
+      "resume_after_recheck": "校验后恢复做种",
+      "test": "测试连接",
+      "test_failed": "连接失败"
+    }
+  },
+  "downloader": {
+    "action": {
+      "cd2_repair": "CD2 修复"
+    },
+    "cd2_repair_disabled": "请先在设置中启用 CloudDrive2 回退"
+  }
+}

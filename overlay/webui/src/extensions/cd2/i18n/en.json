@@ -1,0 +1,27 @@
+{
+  "config": {
+    "cd2_set": {
+      "title": "CloudDrive2 Offline Fallback",
+      "desc": "When qBittorrent stalls, submit 115 offline downloads and sync back for reseeding.",
+      "enable": "Enable CD2 fallback",
+      "host": "CD2 host",
+      "username": "Username",
+      "password": "Password",
+      "offline_dir": "115 cloud offline path",
+      "local_path": "Local sync path",
+      "stall_time": "Stall timeout (minutes)",
+      "stall_min_speed": "Min speed (KB/s)",
+      "scan_interval": "Scan interval (seconds)",
+      "pause_qb_torrent": "Pause qB task before submit",
+      "resume_after_recheck": "Resume after recheck",
+      "test": "Test connection",
+      "test_failed": "Connection failed"
+    }
+  },
+  "downloader": {
+    "action": {
+      "cd2_repair": "CD2 repair"
+    },
+    "cd2_repair_disabled": "Enable CloudDrive2 fallback in Settings first"
+  }
+}

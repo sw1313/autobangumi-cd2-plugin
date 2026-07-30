@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+node_modules/
+dist/
+
+# Never publish runtime configuration or secrets.
+config/cd2.json
+.env
+.env.*
+!.env.example
+
+# Files from the original combined local-extension bundle are intentionally
+# outside this CD2-only repository.
+integration/
+overlay/extensions/cd2/cd2/
+overlay/extensions/cd2/backend/cd2/player_api.py
+overlay/webui/src/extensions/player/
+overlay/webui/src/local-extensions.ts

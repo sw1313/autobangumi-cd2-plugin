@@ -1,0 +1,2 @@
+clouddrive2-client>=0.2.0
+grpcio>=1.60.0
