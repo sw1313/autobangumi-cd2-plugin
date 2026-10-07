@@ -110,9 +110,7 @@ def migrate_cd2_config(cd2: dict) -> dict:
         if is_local_fs_path(target):
             if not local:
                 mapped = resolve_local_base(target, "")
-                result["local_path"] = (
-                    mapped.as_posix() if mapped else "/cd2-offline"
-                )
+                result["local_path"] = str(mapped) if mapped else "/cd2-offline"
         elif not offline:
             result["offline_dir"] = target
         result["target_dir"] = ""

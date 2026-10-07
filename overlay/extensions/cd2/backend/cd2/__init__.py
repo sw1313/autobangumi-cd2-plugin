@@ -9,8 +9,9 @@ def register_api(v1_router) -> None:
 
 def get_scheduler_tasks(settings_obj):
     from cd2.config import get_cd2_settings
-    from cd2.loops import cd2_tick
     from module.core.scheduler import PeriodicTask
+
+    from cd2.loops import cd2_tick
 
     def _cfg():
         return get_cd2_settings()

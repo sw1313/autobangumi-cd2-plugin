@@ -6,8 +6,12 @@ from collections.abc import Iterator
 from typing import Callable
 
 import grpc
+from google.protobuf import empty_pb2
+
 from clouddrive2_client import CloudDriveClient
 from clouddrive2_client.proto import clouddrive_pb2
+
+from cd2.sync import completed_copy_task_keys
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +273,85 @@ class CD2Client:
             raise
         return list(response.offlineFiles)
 
+    def paused_copy_upload_keys(self, dest_prefix: str, limit: int) -> list[str]:
+        """Keys of paused copy-uploads whose destination is under dest_prefix."""
+        if not self._client:
+            self.connect()
+        assert self._client is not None
+        prefix = (dest_prefix or "").replace("\\", "/").rstrip("/")
+        if not prefix or limit <= 0:
+            return []
+
+        keys: list[str] = []
+        for page in range(0, 20):
+            request = clouddrive_pb2.GetUploadFileListRequest(
+                getAll=False,
+                itemsPerPage=100,
+                pageNumber=page,
+                operatorTypeFilter=clouddrive_pb2.UploadFileInfo.Copy,
+                statusFilter=clouddrive_pb2.UploadFileInfo.Pause,
+            )
+            response = self._client.stub.GetUploadFileList(
+                request,
+                metadata=self._client._create_authorized_metadata(),
+                timeout=CD2_RPC_TIMEOUT_SEC,
+            )
+            files = list(response.uploadFiles)
+            if not files:
+                break
+            for item in files:
+                dest = (item.destPath or "").replace("\\", "/").rstrip("/")
+                if dest != prefix and not dest.startswith(prefix + "/"):
+                    continue
+                if item.key:
+                    keys.append(item.key)
+                    if len(keys) >= limit:
+                        return keys
+            if len(files) < 100:
+                break
+        return keys
+
+    def remove_completed_copy_tasks(self, dest_prefix: str) -> int:
+        """Drop finished copy tasks that landed in the local staging folder."""
+        if not self._client:
+            self.connect()
+        assert self._client is not None
+        result = self._client.stub.GetCopyTasks(
+            empty_pb2.Empty(),
+            metadata=self._client._create_authorized_metadata(),
+            timeout=CD2_RPC_TIMEOUT_SEC,
+        )
+        keys = completed_copy_task_keys(list(result.copyTasks), dest_prefix)
+        if not keys:
+            return 0
+        removed = 0
+        metadata = self._client._create_authorized_metadata()
+        for start in range(0, len(keys), 100):
+            chunk = keys[start : start + 100]
+            response = self._client.stub.RemoveCopyTasks(
+                clouddrive_pb2.CopyTaskBatchRequest(taskKeys=chunk),
+                metadata=metadata,
+                timeout=CD2_RPC_TIMEOUT_SEC,
+            )
+            if not response.success:
+                logger.error("[CD2] RemoveCopyTasks failed: %s", response.errorMessage)
+                break
+            removed += response.affectedCount or len(chunk)
+        return removed
+
+    def resume_upload_files(self, keys: list[str]) -> int:
+        if not keys:
+            return 0
+        if not self._client:
+            self.connect()
+        assert self._client is not None
+        self._client.stub.ResumeUploadFiles(
+            clouddrive_pb2.MultpleUploadFileKeyRequest(keys=keys),
+            metadata=self._client._create_authorized_metadata(),
+            timeout=CD2_RPC_TIMEOUT_SEC,
+        )
+        return len(keys)
+
     def copy_files(self, source_paths: list[str], dest_path: str) -> bool:
         if not self._client:
             self.connect()
@@ -396,6 +479,19 @@ class CD2Session:
             return False
         cli = self._client
         return await asyncio.to_thread(cli.copy_files, source_paths, dest_path)
+
+    async def resume_paused_copy_uploads(self, dest_prefix: str, limit: int) -> int:
+        cli = self._client
+
+        def _resume() -> int:
+            keys = cli.paused_copy_upload_keys(dest_prefix, limit)
+            return cli.resume_upload_files(keys)
+
+        return await asyncio.to_thread(_resume)
+
+    async def remove_completed_copy_tasks(self, dest_prefix: str) -> int:
+        cli = self._client
+        return await asyncio.to_thread(cli.remove_completed_copy_tasks, dest_prefix)
 
 
 async def run_cd2(

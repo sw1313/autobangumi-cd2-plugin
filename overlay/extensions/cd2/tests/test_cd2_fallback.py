@@ -1,7 +1,10 @@
+import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
 from cd2.client import is_duplicate_offline_error, normalize_info_hash
 from cd2.config import migrate_cd2_config
 from cd2.fallback import (
@@ -10,6 +13,7 @@ from cd2.fallback import (
     is_dead_torrent,
 )
 from cd2.sync import (
+    completed_copy_task_keys,
     find_video_in_src,
     is_local_download_complete,
     is_local_fs_path,
@@ -151,11 +155,20 @@ class TestResolveCd2Content:
         found = resolve_cd2_content(tmp_path, "Anime Title", "deadbeef")
         assert found == folder
 
-    def test_find_by_hash_in_name(self, tmp_path):
-        folder = tmp_path / "task-deadbeef-files"
+    def test_find_by_exact_hash_dir(self, tmp_path):
+        folder = tmp_path / "deadbeef"
         folder.mkdir()
         found = resolve_cd2_content(tmp_path, "Other", "deadbeef")
         assert found == folder
+
+    def test_does_not_search_similar_names(self, tmp_path):
+        decoy = tmp_path / "task-deadbeef-files"
+        decoy.mkdir()
+        similar = tmp_path / "Show 2 [03].mp4"
+        similar.mkdir()
+        (similar / "Show 2 [03].mp4").write_bytes(b"x" * 100)
+        found = resolve_cd2_content(tmp_path, "Show [03].mp4", "deadbeef")
+        assert found is None
 
     def test_find_cd2_wrapper_folder_by_torrent_name(self, tmp_path):
         release = (
@@ -167,6 +180,37 @@ class TestResolveCd2Content:
         (wrapper / release).write_bytes(b"complete")
         found = resolve_cd2_content(tmp_path, release, "deadbeef")
         assert found == wrapper
+
+    def test_does_not_steal_another_episode_wrapper(self, tmp_path):
+        other = tmp_path / "Show [11].mp4"
+        other.mkdir()
+        (other / "Show [11].mp4").write_bytes(b"x" * 100)
+        found = resolve_cd2_content(tmp_path, "Show [03].mp4", "abc123def456")
+        assert found is None
+
+
+class TestCompletedCopyTaskKeys:
+    def test_only_completed_tasks_for_the_staging_folder(self):
+        tasks = [
+            SimpleNamespace(
+                status=3,
+                sourcePath="/115/anime/done.mp4",
+                destPath="/volume1/videos/cd2-offline",
+            ),
+            SimpleNamespace(
+                status=2,
+                sourcePath="/115/anime/running.mp4",
+                destPath="/volume1/videos/cd2-offline",
+            ),
+            SimpleNamespace(
+                status=3,
+                sourcePath="/115/anime/other.mp4",
+                destPath="/volume1/videos/anime",
+            ),
+        ]
+        assert completed_copy_task_keys(tasks, "/volume1/videos/cd2-offline") == [
+            "/115/anime/done.mp4:/volume1/videos/cd2-offline"
+        ]
 
 
 class TestFindVideoInSrc:
@@ -186,6 +230,13 @@ class TestFindVideoInSrc:
         small.write_bytes(b"x")
         main.write_bytes(b"x" * 1000)
         assert find_video_in_src(wrapper, "Show.S01E01.1080p.mkv") == main
+
+    def test_does_not_substitute_a_different_video(self, tmp_path):
+        wrapper = tmp_path / "Ken 2 [07].mp4"
+        wrapper.mkdir()
+        video = wrapper / "Ken 2 [07].mp4"
+        video.write_bytes(b"x" * 100)
+        assert find_video_in_src(wrapper, "Haibara [02].mp4") is None
 
 
 class TestMoveContentToQb:
@@ -228,6 +279,18 @@ class TestMoveContentToQb:
         move_content_to_qb(wrapper, dst)
         assert dst.read_bytes() == b"complete"
         assert not wrapper.exists()
+
+    def test_does_not_replace_a_different_release(self, tmp_path):
+        wrapper = tmp_path / "Ken 2 [07].mp4"
+        wrapper.mkdir()
+        (wrapper / "Ken 2 [07].mp4").write_bytes(b"sakurato")
+        dst = tmp_path / "qb" / "Haibara [02].mp4"
+        dst.parent.mkdir(parents=True)
+        dst.write_bytes(b"haibara")
+        with pytest.raises(FileNotFoundError):
+            move_content_to_qb(wrapper, dst)
+        assert dst.read_bytes() == b"haibara"
+        assert wrapper.exists()
 
 
 class TestResolveLocalBase:
@@ -328,8 +391,6 @@ class TestNeedsRedownload:
         torrent = _torrent(
             content_path=str(video),
             total_size=1000,
-            progress=1.0,
-            state="stoppedUP",
         )
         assert CD2FallbackManager()._qb_content_complete(torrent) is True
 
@@ -412,10 +473,15 @@ class TestLocalDownloadComplete:
         (folder / "video.mkv").write_bytes(b"x" * 100)
         assert is_local_download_complete(folder, 1000) is False
 
-    def test_complete_without_expected_size(self, tmp_path):
+    def test_unknown_size_is_not_complete(self, tmp_path):
         file = tmp_path / "video.mkv"
         file.write_bytes(b"x")
-        assert is_local_download_complete(file, 0) is True
+        assert is_local_download_complete(file, 0) is False
+
+    def test_different_size_is_not_complete(self, tmp_path):
+        file = tmp_path / "video.mkv"
+        file.write_bytes(b"x" * 1400)
+        assert is_local_download_complete(file, 1000) is False
 
     def test_local_content_size_recursive(self, tmp_path):
         root = tmp_path / "root"
@@ -424,3 +490,24 @@ class TestLocalDownloadComplete:
         (root / "sub").mkdir()
         (root / "sub" / "b.mkv").write_bytes(b"67890")
         assert local_content_size(root) == 10
+
+
+class TestOfflineListFailure:
+    def test_list_error_returns_zero_instead_of_raising(self):
+        manager = CD2FallbackManager()
+
+        class Session:
+            async def list_finished_offline_by_hash(self, folder):
+                raise RuntimeError("Transferred a partial file")
+
+        manager._session = Session()
+        result = asyncio.run(
+            manager._ensure_local_copy(
+                None,
+                [],
+                "/115/anime",
+                "/volume1/videos/cd2-offline",
+                Path("/cd2-offline"),
+            )
+        )
+        assert result == 0

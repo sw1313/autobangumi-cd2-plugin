@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import grpc
 import pytest
+
 from cd2.client import (
     CD2Client,
     _file_has_content,

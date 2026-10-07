@@ -1,5 +1,4 @@
 import logging
-import re
 import shutil
 from pathlib import Path
 
@@ -81,11 +80,6 @@ def resolve_local_base(target_dir: str, local_path: str = "") -> Path | None:
     return None
 
 
-def _normalize_match_name(name: str) -> str:
-    stem = Path(name).stem if "." in name else name
-    return re.sub(r"[\s._\-+\[\]()（）【】]+", "", stem.lower())
-
-
 def _list_video_files(root: Path) -> list[Path]:
     if root.is_file() and root.suffix.lower() in _VIDEO_SUFFIXES:
         return [root]
@@ -98,9 +92,19 @@ def _list_video_files(root: Path) -> list[Path]:
     ]
 
 
+def _same_file_name(left: str, right: str) -> bool:
+    return left == right or left.lower() == right.lower()
+
+
 def find_video_in_src(src: Path, dst_name: str = "") -> Path | None:
-    """Pick the video file inside a CD2 offline wrapper folder."""
+    """Return the video that belongs to this path.
+
+    A requested destination name must match. Another video in the same folder
+    is a different file and must not be substituted.
+    """
     if src.is_file():
+        if dst_name and not _same_file_name(src.name, dst_name):
+            return None
         return src
 
     videos = _list_video_files(src)
@@ -109,23 +113,13 @@ def find_video_in_src(src: Path, dst_name: str = "") -> Path | None:
 
     if dst_name:
         for video in videos:
-            if video.name == dst_name:
+            if _same_file_name(video.name, dst_name):
                 return video
-        lower = dst_name.lower()
-        for video in videos:
-            if video.name.lower() == lower:
-                return video
+        return None
 
     if len(videos) == 1:
         return videos[0]
-
-    if dst_name:
-        dst_norm = _normalize_match_name(dst_name)
-        for video in videos:
-            if _normalize_match_name(video.name) == dst_norm:
-                return video
-
-    return max(videos, key=lambda item: item.stat().st_size)
+    return None
 
 
 def resolve_cd2_local_dest(local_path: str = "", target_dir: str = "") -> str | None:
@@ -149,35 +143,55 @@ def resolve_cd2_local_dest(local_path: str = "", target_dir: str = "") -> str | 
     return None
 
 
+def completed_copy_task_keys(
+    tasks: list,
+    dest_prefix: str,
+    *,
+    completed_status: int = 3,
+) -> list[str]:
+    """Copy-task keys CD2 accepts: ``sourcePath:destPath``, unchanged.
+
+    Only completed tasks whose destination is the local staging folder are
+    included. Other destinations and unfinished tasks stay in the list.
+    """
+    prefix = (dest_prefix or "").replace("\\", "/").rstrip("/")
+    if not prefix:
+        return []
+    keys: list[str] = []
+    for task in tasks:
+        if getattr(task, "status", None) != completed_status:
+            continue
+        source = getattr(task, "sourcePath", "") or ""
+        dest = getattr(task, "destPath", "") or ""
+        normalized = dest.replace("\\", "/").rstrip("/")
+        if normalized != prefix and not normalized.startswith(prefix + "/"):
+            continue
+        keys.append(f"{source}:{dest}")
+    return keys
+
+
 def join_cloud_path(base: str, name: str) -> str:
     return f"{base.rstrip('/')}/{name.lstrip('/')}"
 
 
 def resolve_cd2_content(local_base: Path, torrent_name: str, info_hash: str) -> Path | None:
-    """Find downloaded content directory/file under CD2 local mount."""
+    """Return the file CD2 stored for this magnet.
+
+    The info hash is the identity. ``torrent_name`` must be that hash's own
+    name (the offline task name, or this qB torrent's name). Sibling files are
+    not searched: a similar title is a different magnet.
+    """
     if not local_base.exists():
         return None
 
-    candidates = [
-        local_base / torrent_name,
-        local_base / info_hash,
-        local_base / info_hash.upper(),
-    ]
+    candidates: list[Path] = []
+    if torrent_name:
+        candidates.append(local_base / torrent_name)
+    if info_hash:
+        candidates.extend([local_base / info_hash, local_base / info_hash.upper()])
     for path in candidates:
-        if path.exists():
+        if path != local_base and path.exists():
             return path
-
-    needle = info_hash.lower()
-    norm_torrent = _normalize_match_name(torrent_name)
-    for child in local_base.iterdir():
-        if needle in child.name.lower():
-            return child
-        if norm_torrent and _normalize_match_name(child.name) == norm_torrent:
-            return child
-        if child.is_dir() and child.suffix.lower() in _VIDEO_SUFFIXES:
-            inner = find_video_in_src(child, torrent_name)
-            if inner:
-                return child
     return None
 
 
@@ -190,13 +204,15 @@ def local_content_size(path: Path) -> int:
 
 
 def is_local_download_complete(src: Path, expected_size: int) -> bool:
-    """Heuristic: local folder/file size matches qB torrent total size."""
+    """True when local bytes match this torrent's size.
+
+    A larger different file used to pass the old one-sided check and then
+    replace the qB target.
+    """
     actual = local_content_size(src)
-    if actual <= 0:
+    if actual <= 0 or expected_size <= 0:
         return False
-    if expected_size <= 0:
-        return True
-    return actual >= expected_size * 0.98
+    return abs(actual - expected_size) <= expected_size * 0.02
 
 
 def _move_file(src: Path, dst: Path) -> None:

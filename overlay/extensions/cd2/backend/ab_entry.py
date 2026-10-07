@@ -8,14 +8,16 @@ from pathlib import Path
 
 APP_DIR = Path(os.environ.get("AB_APP_DIR", "/app"))
 CD2_BACKEND = Path("/extensions/cd2/backend")
+HFZY_BACKEND = Path("/extensions/hfzy/backend")
 
 # AutoBangumi core (module.*) must be importable before bootstrap patches it.
 os.chdir(APP_DIR)
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-if CD2_BACKEND.is_dir() and str(CD2_BACKEND) not in sys.path:
-    sys.path.insert(0, str(CD2_BACKEND))
+for backend in (HFZY_BACKEND, CD2_BACKEND):
+    if backend.is_dir() and str(backend) not in sys.path:
+        sys.path.insert(0, str(backend))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("cd2.entry")
@@ -33,6 +35,18 @@ try:
         )
 except Exception:
     logger.exception("CD2 bootstrap crashed")
+
+try:
+    from hfzy.bootstrap import install as install_hfzy
+    from hfzy.bootstrap import is_installed as hfzy_installed
+
+    install_hfzy()
+    if hfzy_installed():
+        logger.info("HFZY bootstrap OK — misc feature routes registered")
+    else:
+        logger.error("HFZY bootstrap did not complete")
+except Exception:
+    logger.exception("HFZY bootstrap crashed")
 
 if __name__ == "__main__":
     import runpy

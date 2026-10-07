@@ -5,10 +5,12 @@ from fastapi import APIRouter, Body, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from cd2.config import load_cd2_dict, reload_cd2_settings, save_cd2_dict
-from module.api.deps import get_context
 from module.core import AppContext
 from module.security.api import get_current_user
+
+from cd2.config import load_cd2_dict, reload_cd2_settings, save_cd2_dict
+
+from module.api.deps import get_context
 
 logger = logging.getLogger(__name__)
 

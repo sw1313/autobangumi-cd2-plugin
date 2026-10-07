@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 STALL_STATES = {"stalledDL", "missingFiles", "error"}
 MAX_AUTO_SUBMISSIONS_PER_CYCLE = 5
+MAX_RESUME_COPY_UPLOADS_PER_CYCLE = 5
 CD2_SUBMITTED_TAG = "cd2:submitted"
 CD2_FORCE_REPAIR_TAG = "cd2:force-repair"
 _cd2_submit_lock = asyncio.Lock()
@@ -343,6 +344,13 @@ class CD2FallbackManager:
         except OfflineLocalFsNotSupportedError as e:
             logger.warning("[CD2] Cannot list offline tasks (%s)", e)
             return 0
+        except Exception as e:
+            logger.warning(
+                "[CD2] Offline list failed, keep syncing files already in %s: %s",
+                local_base,
+                e,
+            )
+            return 0
 
         if not finished:
             return 0
@@ -370,10 +378,17 @@ class CD2FallbackManager:
         if not unique_paths:
             return 0
 
-        ok = await self._session.copy_cloud_files_to_local(
-            unique_paths,
-            cd2_local_dest,
-        )
+        try:
+            ok = await self._session.copy_cloud_files_to_local(
+                unique_paths,
+                cd2_local_dest,
+            )
+        except Exception as e:
+            logger.warning(
+                "[CD2] Cloud copy request failed, keep syncing local files: %s",
+                e,
+            )
+            return 0
         if ok:
             logger.info(
                 "[CD2] Started copy from cloud to local: %d item(s) -> %s",
@@ -949,8 +964,14 @@ class CD2FallbackManager:
                 )
                 continue
 
-            offline_name = getattr(offline, "name", "") or name
-            src = resolve_cd2_content(local_base, offline_name, norm_hash)
+            offline_name = getattr(offline, "name", "") or ""
+            src = None
+            for exact_name in (offline_name, name):
+                if not exact_name:
+                    continue
+                src = resolve_cd2_content(local_base, exact_name, norm_hash)
+                if src:
+                    break
             if not src:
                 logger.warning(
                     "[CD2] Finished offline but local files not found: %s",
@@ -1001,7 +1022,11 @@ class CD2FallbackManager:
         async with CD2Session.from_cfg(cfg) as session:
             self._session = session
             try:
-                submitted = await self.process_stalled_torrents()
+                try:
+                    submitted = await self.process_stalled_torrents()
+                except Exception as e:
+                    logger.error("[CD2] Stalled scan failed: %s", e)
+                    submitted = 0
                 try:
                     synced = await self.process_cd2_completed()
                 except Exception as e:
@@ -1061,6 +1086,12 @@ class CD2FallbackManager:
             )
         except OfflineLocalFsNotSupportedError:
             return {}
+        except Exception as e:
+            logger.warning(
+                "[CD2] Offline list failed, new submits will not reuse existing tasks: %s",
+                e,
+            )
+            return {}
 
     async def _incomplete_bangumi_torrents(self, client: DownloadClient) -> list[dict]:
         torrents = await client.get_torrent_info(
@@ -1082,6 +1113,15 @@ class CD2FallbackManager:
         local_base = self._sync_local_base(cfg)
         offline_target = self._offline_target(cfg)
         cd2_local_dest = self._cd2_local_dest(cfg)
+
+        if cd2_local_dest and self._session is not None:
+            try:
+                removed = await self._session.remove_completed_copy_tasks(cd2_local_dest)
+            except Exception as e:
+                logger.warning("[CD2] Remove completed copy tasks failed: %s", e)
+            else:
+                if removed:
+                    logger.info("[CD2] Removed %d completed copy task(s)", removed)
 
         async with DownloadClient() as client:
             pending = await self._incomplete_bangumi_torrents(client)
@@ -1105,13 +1145,50 @@ class CD2FallbackManager:
                     "[CD2] Cannot map local_path to CD2 absolute path; "
                     "use /cd2-offline or a /volume1/... path"
                 )
+            if cd2_local_dest and self._session is not None:
+                try:
+                    resumed = await self._session.resume_paused_copy_uploads(
+                        cd2_local_dest,
+                        MAX_RESUME_COPY_UPLOADS_PER_CYCLE,
+                    )
+                except Exception as e:
+                    logger.warning("[CD2] Resume paused copies failed: %s", e)
+                else:
+                    if resumed:
+                        logger.info(
+                            "[CD2] Resumed %d paused copy upload(s) -> %s",
+                            resumed,
+                            cd2_local_dest,
+                        )
 
             if local_base is not None:
                 if not local_base.exists():
                     logger.warning("[CD2] local path does not exist: %s", local_base)
                     return 0
-                logger.debug(
-                    "[CD2] Scanning local folder for completed offline tasks: %s",
+                finished: dict = {}
+                if offline_target and self._session is not None:
+                    try:
+                        finished = await self._session.list_finished_offline_by_hash(
+                            offline_target,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[CD2] Offline list failed, will not pair files by name: %s",
+                            e,
+                        )
+                        finished = {}
+                if finished:
+                    logger.debug(
+                        "[CD2] Syncing %d finished offline hash(es) from %s",
+                        len(finished),
+                        local_base,
+                    )
+                    return synced + await self._sync_pending_from_api(
+                        client, pending, finished, local_base, cfg
+                    )
+                logger.warning(
+                    "[CD2] No offline hash map; only this torrent's exact folder "
+                    "under %s can be moved",
                     local_base,
                 )
                 return synced + await self._sync_pending_from_local(
@@ -1128,6 +1205,9 @@ class CD2FallbackManager:
                 )
             except OfflineLocalFsNotSupportedError as e:
                 logger.warning("[CD2] Offline list API unavailable (%s)", e)
+                return synced
+            except Exception as e:
+                logger.warning("[CD2] Offline list failed (%s)", e)
                 return synced
 
             if not finished:
