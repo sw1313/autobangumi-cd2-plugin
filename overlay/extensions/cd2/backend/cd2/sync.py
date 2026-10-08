@@ -6,6 +6,10 @@ logger = logging.getLogger(__name__)
 
 _VIDEO_SUFFIXES = {".mkv", ".mp4", ".avi", ".wmv", ".flv", ".ts", ".m4v"}
 
+# CloudDrive2's own default. Backup runs before copy, so a full backup
+# queue keeps copy-to-local transfers waiting.
+_DEFAULT_UPLOAD_PRIORITY = ("Mount", "Backup", "CopyTask")
+
 _CLOUD_PATH_PREFIXES = (
     "/115/",
     "/189/",
@@ -168,6 +172,33 @@ def completed_copy_task_keys(
             continue
         keys.append(f"{source}:{dest}")
     return keys
+
+
+def copy_before_backup(order: list[str] | None) -> list[str] | None:
+    """Put CopyTask immediately before Backup.
+
+    ``None`` means the current order already lets copies run first, so the
+    caller should not write system settings. An empty list or ``Natural``
+    is CloudDrive2's default, which schedules backups ahead of copies.
+    Names other than those two stay where they are.
+    """
+
+    if not order or order == ["Natural"]:
+        current = list(_DEFAULT_UPLOAD_PRIORITY)
+    else:
+        current = list(order)
+    if "Backup" not in current:
+        return None
+    backup_at = current.index("Backup")
+    if "CopyTask" not in current:
+        current.insert(backup_at, "CopyTask")
+        return current
+    copy_at = current.index("CopyTask")
+    if copy_at < backup_at:
+        return None
+    current.pop(copy_at)
+    current.insert(current.index("Backup"), "CopyTask")
+    return current
 
 
 def join_cloud_path(base: str, name: str) -> str:

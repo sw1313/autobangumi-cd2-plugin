@@ -10,6 +10,7 @@ from cd2.client import (
     _file_has_content,
     iter_sub_files,
 )
+from cd2.sync import copy_before_backup
 
 
 def _sub_files_reply(*files):
@@ -155,3 +156,24 @@ class TestPathHasContent:
             cd2.path_has_content("/115/anime/release.mkv/release.mkv")
             is True
         )
+
+
+class TestCopyBeforeBackup:
+    def test_default_order_puts_copy_ahead_of_backup(self):
+        assert copy_before_backup(None) == ["Mount", "CopyTask", "Backup"]
+        assert copy_before_backup([]) == ["Mount", "CopyTask", "Backup"]
+        assert copy_before_backup(["Natural"]) == ["Mount", "CopyTask", "Backup"]
+        assert copy_before_backup(["Mount", "Backup", "CopyTask"]) == [
+            "Mount",
+            "CopyTask",
+            "Backup",
+        ]
+
+    def test_existing_copy_priority_is_left_alone(self):
+        assert copy_before_backup(["Mount", "CopyTask", "Backup"]) is None
+        assert copy_before_backup(["CopyTask", "Mount", "Backup"]) is None
+
+    def test_other_operators_keep_their_place(self):
+        assert copy_before_backup(
+            ["Mount", "Backup", "RemoteUpload", "CopyTask"]
+        ) == ["Mount", "CopyTask", "Backup", "RemoteUpload"]

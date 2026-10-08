@@ -11,7 +11,7 @@ from google.protobuf import empty_pb2
 from clouddrive2_client import CloudDriveClient
 from clouddrive2_client.proto import clouddrive_pb2
 
-from cd2.sync import completed_copy_task_keys
+from cd2.sync import completed_copy_task_keys, copy_before_backup
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +339,38 @@ class CD2Client:
             removed += response.affectedCount or len(chunk)
         return removed
 
+    def prefer_copy_over_backup(self) -> list[str] | None:
+        """Schedule copy uploads ahead of backup uploads.
+
+        Only ``operatorPriorityOrder`` is sent. Backup jobs are not paused
+        or removed, and download tasks are left alone. Returns the new
+        order, or None when no change was needed.
+        """
+        if not self._client:
+            self.connect()
+        assert self._client is not None
+        metadata = self._client._create_authorized_metadata()
+        current = self._client.stub.GetSystemSettings(
+            empty_pb2.Empty(),
+            metadata=metadata,
+            timeout=CD2_RPC_TIMEOUT_SEC,
+        )
+        if current.HasField("operatorPriorityOrder"):
+            order = list(current.operatorPriorityOrder.values)
+        else:
+            order = []
+        updated = copy_before_backup(order)
+        if updated is None:
+            return None
+        settings_msg = clouddrive_pb2.SystemSettings()
+        settings_msg.operatorPriorityOrder.values.extend(updated)
+        self._client.stub.SetSystemSettings(
+            settings_msg,
+            metadata=metadata,
+            timeout=CD2_RPC_TIMEOUT_SEC,
+        )
+        return updated
+
     def resume_upload_files(self, keys: list[str]) -> int:
         if not keys:
             return 0
@@ -479,6 +511,10 @@ class CD2Session:
             return False
         cli = self._client
         return await asyncio.to_thread(cli.copy_files, source_paths, dest_path)
+
+    async def prefer_copy_over_backup(self) -> list[str] | None:
+        cli = self._client
+        return await asyncio.to_thread(cli.prefer_copy_over_backup)
 
     async def resume_paused_copy_uploads(self, dest_prefix: str, limit: int) -> int:
         cli = self._client

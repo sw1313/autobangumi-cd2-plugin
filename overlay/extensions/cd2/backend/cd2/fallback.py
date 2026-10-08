@@ -1023,6 +1023,16 @@ class CD2FallbackManager:
             self._session = session
             try:
                 try:
+                    updated = await session.prefer_copy_over_backup()
+                except Exception as e:
+                    logger.warning("[CD2] Could not prefer copy tasks over backup: %s", e)
+                else:
+                    if updated:
+                        logger.info(
+                            "[CD2] Upload scheduling runs copy tasks before backup: %s",
+                            ", ".join(updated),
+                        )
+                try:
                     submitted = await self.process_stalled_torrents()
                 except Exception as e:
                     logger.error("[CD2] Stalled scan failed: %s", e)
