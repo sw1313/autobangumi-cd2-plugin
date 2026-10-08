@@ -2,6 +2,7 @@ import asyncio
 import logging
 import posixpath
 import threading
+import time
 from collections.abc import Iterator
 from typing import Callable
 
@@ -59,6 +60,31 @@ def parse_grpc_address(host: str) -> str:
 
 def normalize_info_hash(value: str) -> str:
     return value.lower().replace("0x", "").strip()
+
+
+_TRANSIENT_RPC_CODES = {
+    grpc.StatusCode.INTERNAL,
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+    grpc.StatusCode.RESOURCE_EXHAUSTED,
+}
+_LIST_OFFLINE_RETRY_DELAYS = (0.4, 0.8)
+_CACHE_MISS = object()
+
+
+def brief_rpc_error(exc: BaseException) -> str:
+    """One line for logs. RpcError's default text is a multi-line dump."""
+    code = getattr(exc, "code", None)
+    details = getattr(exc, "details", None)
+    if callable(code) and callable(details):
+        try:
+            return f"{code().name}: {details()}"
+        except Exception:
+            pass
+    text = str(exc).strip()
+    if not text:
+        return type(exc).__name__
+    return text.splitlines()[0]
 
 
 def _file_has_content(file_info: object) -> bool:
@@ -263,18 +289,46 @@ class CD2Client:
         if not self._client:
             self.connect()
         assert self._client is not None
-        request = clouddrive_pb2.FileRequest(path=folder)
+        cache: dict[str, list | BaseException] = self.__dict__.setdefault(
+            "_offline_list_cache", {}
+        )
+        cached = cache.get(folder, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            if isinstance(cached, BaseException):
+                raise cached
+            return cached
         try:
-            response = self._client.stub.ListOfflineFilesByPath(
-                request,
-                metadata=self._client._create_authorized_metadata(),
-                timeout=CD2_RPC_TIMEOUT_SEC,
-            )
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNIMPLEMENTED:
-                raise OfflineLocalFsNotSupportedError(str(e.details())) from e
+            files = self._list_offline_files(folder)
+        except Exception as e:
+            cache[folder] = e
             raise
-        return list(response.offlineFiles)
+        cache[folder] = files
+        return files
+
+    def _list_offline_files(self, folder: str) -> list:
+        assert self._client is not None
+        request = clouddrive_pb2.FileRequest(path=folder)
+        delays = _LIST_OFFLINE_RETRY_DELAYS
+        for attempt in range(len(delays) + 1):
+            try:
+                response = self._client.stub.ListOfflineFilesByPath(
+                    request,
+                    metadata=self._client._create_authorized_metadata(),
+                    timeout=CD2_RPC_TIMEOUT_SEC,
+                )
+            except grpc.RpcError as e:
+                if e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                    raise OfflineLocalFsNotSupportedError(str(e.details())) from e
+                if e.code() not in _TRANSIENT_RPC_CODES or attempt == len(delays):
+                    raise
+                logger.debug(
+                    "[CD2] Offline list interrupted, retrying: %s",
+                    brief_rpc_error(e),
+                )
+                time.sleep(delays[attempt])
+                continue
+            return list(response.offlineFiles)
+        return []
 
     def paused_copy_upload_keys(self, dest_prefix: str, limit: int) -> list[str]:
         """Keys of paused copy-uploads whose destination is under dest_prefix."""
@@ -391,7 +445,23 @@ class CD2Client:
         if not self._client:
             self.connect()
         assert self._client is not None
-        response = self._client.copy_file(source_paths, dest_path)
+        try:
+            response = self._client.copy_file(source_paths, dest_path)
+        except grpc.RpcError as e:
+            if e.code() != grpc.StatusCode.NOT_FOUND:
+                raise
+            # CopyFile rejects the whole batch when any one path is gone.
+            if len(source_paths) > 1:
+                started = False
+                for path in source_paths:
+                    if self.copy_files([path], dest_path):
+                        started = True
+                return started
+            logger.info(
+                "[CD2] Cloud path is gone, skip copy: %s",
+                brief_rpc_error(e),
+            )
+            return False
         if not response.success:
             logger.error("[CD2] CopyFile failed: %s", response.errorMessage)
             return False

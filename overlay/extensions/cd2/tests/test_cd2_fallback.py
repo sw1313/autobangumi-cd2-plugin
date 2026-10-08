@@ -568,3 +568,82 @@ class TestOfflineListFailure:
             )
         )
         assert result == 0
+
+
+class TestCopyOnlyExistingCloudFiles:
+    def _session(self, exists: bool):
+        class Session:
+            def __init__(self):
+                self.copied = None
+
+            async def list_finished_offline_by_hash(self, folder):
+                return {"abc": SimpleNamespace(name="Show.mp4")}
+
+            async def cloud_content_exists(self, paths):
+                return exists and paths == ["/115/anime/Show.mp4"]
+
+            async def copy_cloud_files_to_local(self, paths, dest):
+                self.copied = (paths, dest)
+                return True
+
+        return Session()
+
+    def _run(self, tmp_path, session):
+        manager = CD2FallbackManager()
+        manager._session = session
+        return asyncio.run(
+            manager._ensure_local_copy(
+                None,
+                [_torrent(hash="abc", name="Show.mp4", total_size=100)],
+                "/115/anime",
+                "/volume1/videos/cd2-offline",
+                tmp_path,
+            )
+        )
+
+    def test_missing_cloud_file_is_not_copied(self, tmp_path):
+        session = self._session(False)
+        assert self._run(tmp_path, session) == 0
+        assert session.copied is None
+
+    def test_existing_cloud_file_is_copied(self, tmp_path):
+        session = self._session(True)
+        assert self._run(tmp_path, session) == 1
+        assert session.copied == (
+            ["/115/anime/Show.mp4"],
+            "/volume1/videos/cd2-offline",
+        )
+
+
+class TestListOfflineRetry:
+    def test_partial_transfer_is_retried(self, monkeypatch):
+        import grpc
+
+        from cd2.client import CD2Client
+
+        class Partial(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.INTERNAL
+
+            def details(self):
+                return "Transferred a partial file"
+
+        class Stub:
+            def __init__(self):
+                self.calls = 0
+
+            def ListOfflineFilesByPath(self, request, metadata=None, timeout=None):
+                self.calls += 1
+                if self.calls < 3:
+                    raise Partial()
+                return SimpleNamespace(offlineFiles=["ok"])
+
+        client = CD2Client.__new__(CD2Client)
+        stub = Stub()
+        client._client = SimpleNamespace(
+            stub=stub,
+            _create_authorized_metadata=lambda: None,
+        )
+        monkeypatch.setattr("cd2.client.time.sleep", lambda _seconds: None)
+        assert client.list_offline_files("/115/anime") == ["ok"]
+        assert stub.calls == 3

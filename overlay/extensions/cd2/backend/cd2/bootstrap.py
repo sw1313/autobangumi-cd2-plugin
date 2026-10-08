@@ -110,5 +110,11 @@ def install() -> None:
         attach_cd2_settings(settings)
     except Exception:
         logger.exception("CD2 settings attach failed (API routes are still active)")
+    try:
+        from cd2.add_tag_retry import install_add_tag_retry
+
+        install_add_tag_retry()
+    except Exception:
+        logger.exception("CD2 add_tag retry patch failed")
     _INSTALLED = True
     logger.info("CD2 extension installed via bootstrap")

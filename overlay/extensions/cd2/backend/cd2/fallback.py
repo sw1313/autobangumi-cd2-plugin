@@ -9,6 +9,7 @@ from cd2.client import (
     OFFLINE_DOWNLOADING,
     OFFLINE_INIT,
     OfflineLocalFsNotSupportedError,
+    brief_rpc_error,
     normalize_info_hash,
     torrent_to_magnet,
 )
@@ -380,10 +381,10 @@ class CD2FallbackManager:
             logger.warning("[CD2] Cannot list offline tasks (%s)", e)
             return 0
         except Exception as e:
-            logger.warning(
+            self._warn_offline_list_once(
                 "[CD2] Offline list failed, keep syncing files already in %s: %s",
                 local_base,
-                e,
+                brief_rpc_error(e),
             )
             return 0
 
@@ -403,11 +404,20 @@ class CD2FallbackManager:
             if src and self._content_complete_at(src, torrent):
                 continue
 
-            offline_name = getattr(offline, "name", "") or name
-            for candidate in {offline_name, name}:
-                if not candidate:
-                    continue
-                cloud_paths.append(join_cloud_path(offline_target, candidate))
+            # Copy only a path CD2 can still see. A finished task whose 115
+            # file was deleted otherwise makes CopyFile fail the whole batch.
+            existing = await self._existing_cloud_paths(
+                offline_target,
+                torrent,
+                offline,
+            )
+            if not existing:
+                logger.debug(
+                    "[CD2] Finished offline task has no cloud file to copy: %s",
+                    name,
+                )
+                continue
+            cloud_paths.extend(existing)
 
         unique_paths = list(dict.fromkeys(cloud_paths))
         if not unique_paths:
@@ -421,7 +431,7 @@ class CD2FallbackManager:
         except Exception as e:
             logger.warning(
                 "[CD2] Cloud copy request failed, keep syncing local files: %s",
-                e,
+                brief_rpc_error(e),
             )
             return 0
         if ok:
@@ -528,7 +538,6 @@ class CD2FallbackManager:
         submitted = failed = 0
         skipped = len(cooled)
         copies_started = 0
-        copy_started_hashes: set[str] = set()
         pending_sync: list[dict] = []
         keep_cooldown: set[str] = set()
 
@@ -563,10 +572,11 @@ class CD2FallbackManager:
                                     offline_tasks=offline_tasks,
                                 )
                             except Exception as e:
-                                logger.error(
+                                detail = str(e).strip() or type(e).__name__
+                                logger.exception(
                                     "[CD2] Submit error for %s: %s",
                                     torrent.get("name", norm_hash[:8]),
-                                    e,
+                                    detail,
                                 )
                                 failed += 1
                                 continue
@@ -581,7 +591,6 @@ class CD2FallbackManager:
                                 offline_tasks = await self._load_offline_tasks(cfg)
                             elif result == "copy_started":
                                 copies_started += 1
-                                copy_started_hashes.add(norm_hash)
                                 keep_cooldown.add(norm_hash)
                                 await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
                                 await client.add_tag(
@@ -589,9 +598,9 @@ class CD2FallbackManager:
                                 )
                             elif result == "synced":
                                 copies_started += 1
-                                copy_started_hashes.add(norm_hash)
                                 keep_cooldown.add(norm_hash)
                             elif result == "pending_sync":
+                                copies_started += 1
                                 keep_cooldown.add(norm_hash)
                             elif result.startswith("skipped_"):
                                 skipped += 1
@@ -601,28 +610,10 @@ class CD2FallbackManager:
 
                         synced = copies_started
                         if pending_sync:
-                            local_base = self._sync_local_base(cfg)
-                            cd2_local_dest = self._cd2_local_dest(cfg)
-                            pending_copy = [
-                                torrent
-                                for torrent in pending_sync
-                                if normalize_info_hash(torrent.get("hash", ""))
-                                not in copy_started_hashes
-                            ]
-                            if (
-                                offline_target
-                                and cd2_local_dest
-                                and local_base is not None
-                                and pending_copy
-                            ):
-                                synced += await self._ensure_local_copy(
-                                    cfg,
-                                    pending_copy,
-                                    offline_target,
-                                    cd2_local_dest,
-                                    local_base,
-                                )
-                            synced += await self._sync_selected_torrents(
+                            # Copy still runs, but its path count is not another
+                            # batch of tasks. The toast already counted each
+                            # selected torrent once above.
+                            await self._sync_selected_torrents(
                                 client, cfg, pending_sync
                             )
                 finally:
@@ -1079,7 +1070,16 @@ class CD2FallbackManager:
                 remaining.append(torrent)
         return synced, remaining
 
+    def _warn_offline_list_once(self, message: str, *args) -> None:
+        """115 often fails the same way for every list in one scan."""
+        if getattr(self, "_offline_list_warned", False):
+            logger.debug(message, *args)
+            return
+        self._offline_list_warned = True
+        logger.warning(message, *args)
+
     async def process(self) -> tuple[int, int]:
+        self._offline_list_warned = False
         cfg = settings.cd2
         if not cfg.enable:
             return 0, 0
@@ -1162,9 +1162,9 @@ class CD2FallbackManager:
         except OfflineLocalFsNotSupportedError:
             return {}
         except Exception as e:
-            logger.warning(
+            self._warn_offline_list_once(
                 "[CD2] Offline list failed, new submits will not reuse existing tasks: %s",
-                e,
+                brief_rpc_error(e),
             )
             return {}
 
@@ -1247,9 +1247,9 @@ class CD2FallbackManager:
                             offline_target,
                         )
                     except Exception as e:
-                        logger.warning(
+                        self._warn_offline_list_once(
                             "[CD2] Offline list failed, will not pair files by name: %s",
-                            e,
+                            brief_rpc_error(e),
                         )
                         finished = {}
                 if finished:
@@ -1261,11 +1261,12 @@ class CD2FallbackManager:
                     return synced + await self._sync_pending_from_api(
                         client, pending, finished, local_base, cfg
                     )
-                logger.warning(
-                    "[CD2] No offline hash map; only this torrent's exact folder "
-                    "under %s can be moved",
-                    local_base,
-                )
+                if not self._offline_list_warned:
+                    logger.warning(
+                        "[CD2] No offline hash map; only this torrent's exact folder "
+                        "under %s can be moved",
+                        local_base,
+                    )
                 return synced + await self._sync_pending_from_local(
                     client, pending, local_base, cfg
                 )
@@ -1282,7 +1283,10 @@ class CD2FallbackManager:
                 logger.warning("[CD2] Offline list API unavailable (%s)", e)
                 return synced
             except Exception as e:
-                logger.warning("[CD2] Offline list failed (%s)", e)
+                self._warn_offline_list_once(
+                    "[CD2] Offline list failed (%s)",
+                    brief_rpc_error(e),
+                )
                 return synced
 
             if not finished:
