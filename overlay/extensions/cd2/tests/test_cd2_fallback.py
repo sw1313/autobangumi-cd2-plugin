@@ -13,6 +13,7 @@ from cd2.fallback import (
     finish_manual_repairs,
     is_complete_torrent,
     is_dead_torrent,
+    offline_task_should_be_replaced,
     release_manual_repairs,
 )
 from cd2.sync import (
@@ -493,6 +494,17 @@ class TestLocalDownloadComplete:
         (root / "sub").mkdir()
         (root / "sub" / "b.mkv").write_bytes(b"67890")
         assert local_content_size(root) == 10
+
+
+class TestOfflineTaskReplace:
+    def test_error_and_finished_tasks_are_replaced(self):
+        assert offline_task_should_be_replaced(3) is True
+        assert offline_task_should_be_replaced(2) is True
+        assert offline_task_should_be_replaced(None) is True
+
+    def test_active_tasks_are_restarted(self):
+        assert offline_task_should_be_replaced(0) is False
+        assert offline_task_should_be_replaced(1) is False
 
 
 class TestManualRepairCooldown:

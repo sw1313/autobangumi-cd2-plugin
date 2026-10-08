@@ -15,7 +15,10 @@ from cd2.sync import completed_copy_task_keys, copy_before_backup
 
 logger = logging.getLogger(__name__)
 
+OFFLINE_INIT = 0
+OFFLINE_DOWNLOADING = 1
 OFFLINE_FINISHED = 2
+OFFLINE_ERROR = 3
 CD2_CONNECT_TIMEOUT_SEC = 15
 CD2_RPC_TIMEOUT_SEC = 60
 

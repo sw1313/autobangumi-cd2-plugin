@@ -6,6 +6,8 @@ from pathlib import Path
 
 from cd2.client import (
     CD2Session,
+    OFFLINE_DOWNLOADING,
+    OFFLINE_INIT,
     OfflineLocalFsNotSupportedError,
     normalize_info_hash,
     torrent_to_magnet,
@@ -128,6 +130,16 @@ def release_manual_repairs(hashes: set[str]) -> None:
     for raw in hashes:
         _manual_repair_inflight.discard(raw)
         _manual_repair_recent.pop(raw, None)
+
+
+def offline_task_should_be_replaced(status: int | None) -> bool:
+    """True when restarting the task will not recreate a deleted 115 file.
+
+    Init and downloading tasks can be restarted in place. An error or finished
+    task stays as a record after its file is deleted, and RestartOfflineTask
+    does not start a new download.
+    """
+    return status not in {OFFLINE_INIT, OFFLINE_DOWNLOADING}
 
 
 def _has_cd2_submitted_tag(torrent: dict) -> bool:
@@ -286,6 +298,40 @@ class CD2FallbackManager:
             return "copy_started"
         logger.error("[CD2] Failed to start cloud-to-local copy: %s", name)
         return "failed"
+
+    async def _replace_offline_task(
+        self,
+        offline_target: str,
+        norm_hash: str,
+        magnet: str,
+        name: str,
+    ) -> bool:
+        """Drop a task whose file is already gone, then submit that magnet once.
+
+        delete_files stays false. The cloud file is already missing, and removing
+        the task record is what lets AddOffline use the original name again.
+        """
+        removed = await self._session.remove_offline_tasks(
+            offline_target,
+            [norm_hash],
+            delete_files=False,
+        )
+        if not removed:
+            logger.error(
+                "[CD2] Failed to remove offline task before resubmit: %s",
+                name,
+            )
+            return False
+        result = await self._session.add_offline_magnet(magnet, offline_target)
+        if result == "ok":
+            logger.info("[CD2] Replaced offline task whose 115 file is gone: %s", name)
+            return True
+        logger.error(
+            "[CD2] Offline task removed but resubmit returned %s: %s",
+            result,
+            name,
+        )
+        return False
 
     async def _needs_redownload(
         self,
@@ -672,23 +718,34 @@ class CD2FallbackManager:
             await client.pause_torrent(torrent_hash)
 
         if offline_item:
-            # 任务还在、文件已经被删：重启原任务，不要新建离线。
-            if await self._session.restart_offline_magnet(
+            status = getattr(offline_item, "status", None)
+            if offline_task_should_be_replaced(status):
+                ok = await self._replace_offline_task(
+                    offline_target,
+                    norm_hash,
+                    magnet,
+                    name,
+                )
+            elif await self._session.restart_offline_magnet(
                 offline_target,
                 norm_hash,
                 magnet,
                 offline_item,
             ):
-                await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
                 logger.info(
-                    "[CD2] Offline task remains but 115 files are gone, restarted task: %s",
+                    "[CD2] Restarted in-progress offline task with no file yet: %s",
                     name,
                 )
-                return "submitted"
-            logger.error("[CD2] Failed to restart existing offline task: %s", name)
-            if cfg.pause_qb_torrent and torrent_hash:
-                await client.resume_torrent(torrent_hash)
-            return "failed"
+                ok = True
+            else:
+                logger.error("[CD2] Failed to restart existing offline task: %s", name)
+                ok = False
+            if not ok:
+                if cfg.pause_qb_torrent and torrent_hash:
+                    await client.resume_torrent(torrent_hash)
+                return "failed"
+            await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
+            return "submitted"
 
         try:
             result = await self._session.add_offline_magnet(
@@ -710,20 +767,16 @@ class CD2FallbackManager:
             )
             if duplicate_paths:
                 return await self._copy_cloud_only(cfg, name, duplicate_paths)
-            if await self._session.restart_offline_magnet(
+            if await self._replace_offline_task(
                 offline_target,
                 norm_hash,
                 magnet,
-                offline_item,
+                name,
             ):
                 await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
-                logger.info(
-                    "[CD2] Existing offline task reported as duplicate, files missing, restarted: %s",
-                    name,
-                )
                 return "submitted"
             logger.error(
-                "[CD2] Offline task already exists and restart failed: %s",
+                "[CD2] Offline task already exists and replace failed: %s",
                 name,
             )
             if cfg.pause_qb_torrent and torrent_hash:
