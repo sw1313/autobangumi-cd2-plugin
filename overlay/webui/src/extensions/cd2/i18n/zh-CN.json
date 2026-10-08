@@ -22,6 +22,9 @@
     "action": {
       "cd2_repair": "CD2 修复"
     },
-    "cd2_repair_disabled": "请先在设置中启用 CloudDrive2 回退"
+    "cd2_repair_disabled": "请先在设置中启用 CloudDrive2 回退",
+    "cd2_repair_sent": "已发送 {n} 项修复",
+    "cd2_repair_sent_partial": "已发送 {n} 项修复，{cooled} 项刚刚发过已跳过",
+    "cd2_repair_cooling": "这些任务刚刚发送过，请几秒后再试"
   }
 }

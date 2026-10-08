@@ -22,6 +22,9 @@
     "action": {
       "cd2_repair": "CD2 repair"
     },
-    "cd2_repair_disabled": "Enable CloudDrive2 fallback in Settings first"
+    "cd2_repair_disabled": "Enable CloudDrive2 fallback in Settings first",
+    "cd2_repair_sent": "Sent {n} repair job(s)",
+    "cd2_repair_sent_partial": "Sent {n} repair job(s). Skipped {cooled} just sent.",
+    "cd2_repair_cooling": "These were just sent. Try again in a few seconds."
   }
 }

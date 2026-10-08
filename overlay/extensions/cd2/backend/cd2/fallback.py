@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 
 from cd2.client import (
@@ -30,7 +31,10 @@ MAX_AUTO_SUBMISSIONS_PER_CYCLE = 5
 MAX_RESUME_COPY_UPLOADS_PER_CYCLE = 5
 CD2_SUBMITTED_TAG = "cd2:submitted"
 CD2_FORCE_REPAIR_TAG = "cd2:force-repair"
+MANUAL_REPAIR_COOLDOWN_SECONDS = 5
 _cd2_submit_lock = asyncio.Lock()
+_manual_repair_recent: dict[str, float] = {}
+_manual_repair_inflight: set[str] = set()
 DOWNLOADING_STATES = {"downloading", "metaDL", "queuedDL", "checkingDL"}
 VERSIONED_RELEASE_RE = re.compile(r"(?i)(?:^|[\s._\-\]])\d{1,3}v\d+(?:\D|$)")
 
@@ -80,6 +84,50 @@ def is_dead_torrent(
             return True
 
     return False
+
+
+def claim_manual_repairs(
+    hashes: set[str], now: float | None = None
+) -> tuple[set[str], set[str]]:
+    """Split hashes into ones to send and ones still cooling down.
+
+    Accepted hashes are recorded before any CD2 call. A hash stays blocked
+    while that repair is in flight, and for a few seconds after it was sent.
+    """
+    current = time.monotonic() if now is None else now
+    accepted: set[str] = set()
+    cooled: set[str] = set()
+    for raw in hashes:
+        if not raw:
+            continue
+        if raw in _manual_repair_inflight:
+            cooled.add(raw)
+            continue
+        seen = _manual_repair_recent.get(raw)
+        if seen is not None and current - seen < MANUAL_REPAIR_COOLDOWN_SECONDS:
+            cooled.add(raw)
+            continue
+        _manual_repair_recent[raw] = current
+        _manual_repair_inflight.add(raw)
+        accepted.add(raw)
+    cutoff = current - MANUAL_REPAIR_COOLDOWN_SECONDS
+    for key, seen in list(_manual_repair_recent.items()):
+        if key not in _manual_repair_inflight and seen < cutoff:
+            del _manual_repair_recent[key]
+    return accepted, cooled
+
+
+def finish_manual_repairs(hashes: set[str]) -> None:
+    """Repair finished. The cooldown timestamp stays so a quick retry waits."""
+    for raw in hashes:
+        _manual_repair_inflight.discard(raw)
+
+
+def release_manual_repairs(hashes: set[str]) -> None:
+    """Repair failed. Allow the same file to be sent again immediately."""
+    for raw in hashes:
+        _manual_repair_inflight.discard(raw)
+        _manual_repair_recent.pop(raw, None)
 
 
 def _has_cd2_submitted_tag(torrent: dict) -> bool:
@@ -212,6 +260,33 @@ class CD2FallbackManager:
                     break
         return existing
 
+    async def _copy_cloud_only(
+        self,
+        cfg,
+        name: str,
+        existing_paths: list[str],
+    ) -> str:
+        """Copy 115 files that are already there. Do not touch the offline task."""
+        cd2_local_dest = self._cd2_local_dest(cfg)
+        if not cd2_local_dest or self._sync_local_base(cfg) is None:
+            logger.error(
+                "[CD2] Cloud files exist but local copy target is not mapped: %s",
+                name,
+            )
+            return "failed"
+        if await self._session.copy_cloud_files_to_local(
+            existing_paths,
+            cd2_local_dest,
+        ):
+            logger.info(
+                "[CD2] 115 files exist, copy only: %s -> %s",
+                name,
+                cd2_local_dest,
+            )
+            return "copy_started"
+        logger.error("[CD2] Failed to start cloud-to-local copy: %s", name)
+        return "failed"
+
     async def _needs_redownload(
         self,
         torrent: dict,
@@ -240,92 +315,6 @@ class CD2FallbackManager:
             torrent.get("name", ""),
         )
         return True
-
-    async def _restart_or_resubmit_offline(
-        self,
-        cfg,
-        torrent: dict,
-        magnet: str,
-        offline_target: str,
-        offline_item: object | None = None,
-    ) -> bool:
-        norm_hash = normalize_info_hash(torrent.get("hash", ""))
-        name = torrent.get("name", norm_hash[:8])
-
-        if await self._session.restart_offline_magnet(
-            offline_target,
-            norm_hash,
-            magnet,
-            offline_item,
-        ):
-            logger.info("[CD2] Restarted offline download: %s", name)
-            return True
-
-        if await self._session.remove_offline_tasks(
-            offline_target,
-            [norm_hash],
-            delete_files=False,
-        ):
-            result = await self._session.add_offline_magnet(
-                magnet,
-                offline_target,
-            )
-            if result in {"ok", "duplicate"}:
-                logger.info("[CD2] Re-submitted offline download: %s", name)
-                return True
-
-        logger.error("[CD2] Failed to restart offline download: %s", name)
-        return False
-
-    async def _resubmit_offline(
-        self,
-        cfg,
-        torrent: dict,
-        magnet: str,
-        offline_target: str,
-        offline_item: object | None = None,
-    ) -> bool:
-        """Idempotently hand a manual repair torrent to CD2.
-
-        Manual repair means "the selected torrent must win", but it does not
-        require deleting an existing 115 offline result for the same hash. Reuse
-        an existing task/file when present to avoid conflicts or losing an
-        already-finished offline download.
-        """
-        norm_hash = normalize_info_hash(torrent.get("hash", ""))
-        name = torrent.get("name", norm_hash[:8])
-
-        if offline_item:
-            existing_paths = await self._existing_cloud_paths(
-                offline_target,
-                torrent,
-                offline_item,
-            )
-            if existing_paths:
-                if await self._session.restart_offline_magnet(
-                    offline_target,
-                    norm_hash,
-                    magnet,
-                    offline_item,
-                ):
-                    logger.info(
-                        "[CD2] Manual offline task restarted/reused: %s",
-                        name,
-                    )
-                    return True
-            else:
-                logger.info(
-                    "[CD2] Offline task exists but cloud files are missing; "
-                    "submit again: %s",
-                    name,
-                )
-
-        result = await self._session.add_offline_magnet(magnet, offline_target)
-        if result in {"ok", "duplicate"}:
-            logger.info("[CD2] Manual offline submit accepted: %s", name)
-            return True
-        logger.error("[CD2] Manual offline submit failed: %s", name)
-        return False
 
     async def _ensure_local_copy(
         self,
@@ -470,115 +459,153 @@ class CD2FallbackManager:
             }
 
         wanted = {normalize_info_hash(h) for h in hashes if h}
-        logger.info("[CD2] Manual repair requested hashes: %s", sorted(wanted))
-        submitted = skipped = failed = 0
+        accepted, cooled = claim_manual_repairs(wanted)
+        if cooled:
+            logger.info(
+                "[CD2] Manual repair cooling down, skip: %s", sorted(cooled)
+            )
+        if not accepted:
+            return {
+                "success": True,
+                "submitted": 0,
+                "synced": 0,
+                "skipped": len(cooled),
+                "failed": 0,
+                "msg_en": (
+                    "These torrents were just sent. Wait a few seconds "
+                    "before trying again."
+                ),
+                "msg_zh": "这些任务刚刚发送过，请几秒后再试。",
+            }
+        logger.info("[CD2] Manual repair requested hashes: %s", sorted(accepted))
+        wanted = accepted
+        submitted = failed = 0
+        skipped = len(cooled)
         copies_started = 0
         copy_started_hashes: set[str] = set()
         pending_sync: list[dict] = []
+        keep_cooldown: set[str] = set()
 
-        async with CD2Session.from_cfg(cfg) as session:
-            self._session = session
-            try:
-                offline_tasks = await self._load_offline_tasks(cfg)
+        try:
+            async with CD2Session.from_cfg(cfg) as session:
+                self._session = session
+                try:
+                    offline_tasks = await self._load_offline_tasks(cfg)
 
-                async with _cd2_submit_lock, DownloadClient() as client:
-                    torrents = await client.get_torrent_info(
-                        category="Bangumi", status_filter=None
-                    )
-                    for torrent in torrents:
-                        torrent_hash = torrent.get("hash", "")
-                        norm_hash = normalize_info_hash(torrent_hash)
-                        if norm_hash not in wanted:
-                            continue
-
-                        logger.info(
-                            "[CD2] Manual repair matched torrent: %s %s",
-                            norm_hash,
-                            torrent.get("name", ""),
+                    async with _cd2_submit_lock, DownloadClient() as client:
+                        torrents = await client.get_torrent_info(
+                            category="Bangumi", status_filter=None
                         )
-                        pending_sync.append(torrent)
-                        try:
-                            result = await self._submit_torrent(
-                                client,
-                                torrent,
-                                cfg,
-                                force=True,
-                                offline_tasks=offline_tasks,
-                            )
-                        except Exception as e:
-                            logger.error(
-                                "[CD2] Submit error for %s: %s",
-                                torrent.get("name", norm_hash[:8]),
-                                e,
-                            )
-                            failed += 1
-                            continue
+                        for torrent in torrents:
+                            torrent_hash = torrent.get("hash", "")
+                            norm_hash = normalize_info_hash(torrent_hash)
+                            if norm_hash not in wanted:
+                                continue
 
-                        if result == "submitted":
-                            submitted += 1
-                            await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
-                            await client.add_tag(torrent_hash, CD2_FORCE_REPAIR_TAG)
-                            offline_tasks = await self._load_offline_tasks(cfg)
-                        elif result == "copy_started":
-                            copies_started += 1
-                            copy_started_hashes.add(norm_hash)
-                            await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
-                            await client.add_tag(torrent_hash, CD2_FORCE_REPAIR_TAG)
-                        elif result == "synced":
-                            copies_started += 1
-                            copy_started_hashes.add(norm_hash)
-                        elif result == "pending_sync":
-                            pass
-                        elif result.startswith("skipped_"):
-                            skipped += 1
-                        elif result == "failed":
-                            failed += 1
-
-                    synced = copies_started
-                    if pending_sync:
-                        local_base = self._sync_local_base(cfg)
-                        cd2_local_dest = self._cd2_local_dest(cfg)
-                        pending_copy = [
-                            torrent
-                            for torrent in pending_sync
-                            if normalize_info_hash(torrent.get("hash", ""))
-                            not in copy_started_hashes
-                        ]
-                        if (
-                            offline_target
-                            and cd2_local_dest
-                            and local_base is not None
-                            and pending_copy
-                        ):
-                            synced += await self._ensure_local_copy(
-                                cfg,
-                                pending_copy,
-                                offline_target,
-                                cd2_local_dest,
-                                local_base,
+                            logger.info(
+                                "[CD2] Manual repair matched torrent: %s %s",
+                                norm_hash,
+                                torrent.get("name", ""),
                             )
-                        synced += await self._sync_selected_torrents(
-                            client, cfg, pending_sync
-                        )
-            finally:
-                self._session = None
+                            pending_sync.append(torrent)
+                            try:
+                                result = await self._submit_torrent(
+                                    client,
+                                    torrent,
+                                    cfg,
+                                    force=True,
+                                    offline_tasks=offline_tasks,
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    "[CD2] Submit error for %s: %s",
+                                    torrent.get("name", norm_hash[:8]),
+                                    e,
+                                )
+                                failed += 1
+                                continue
 
-        ok = submitted > 0 or synced > 0
-        return {
-            "success": ok,
-            "submitted": submitted,
-            "synced": synced,
-            "skipped": skipped,
-            "failed": failed,
-            "msg_en": (
+                            if result == "submitted":
+                                submitted += 1
+                                keep_cooldown.add(norm_hash)
+                                await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
+                                await client.add_tag(
+                                    torrent_hash, CD2_FORCE_REPAIR_TAG
+                                )
+                                offline_tasks = await self._load_offline_tasks(cfg)
+                            elif result == "copy_started":
+                                copies_started += 1
+                                copy_started_hashes.add(norm_hash)
+                                keep_cooldown.add(norm_hash)
+                                await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
+                                await client.add_tag(
+                                    torrent_hash, CD2_FORCE_REPAIR_TAG
+                                )
+                            elif result == "synced":
+                                copies_started += 1
+                                copy_started_hashes.add(norm_hash)
+                                keep_cooldown.add(norm_hash)
+                            elif result == "pending_sync":
+                                keep_cooldown.add(norm_hash)
+                            elif result.startswith("skipped_"):
+                                skipped += 1
+                                keep_cooldown.add(norm_hash)
+                            elif result == "failed":
+                                failed += 1
+
+                        synced = copies_started
+                        if pending_sync:
+                            local_base = self._sync_local_base(cfg)
+                            cd2_local_dest = self._cd2_local_dest(cfg)
+                            pending_copy = [
+                                torrent
+                                for torrent in pending_sync
+                                if normalize_info_hash(torrent.get("hash", ""))
+                                not in copy_started_hashes
+                            ]
+                            if (
+                                offline_target
+                                and cd2_local_dest
+                                and local_base is not None
+                                and pending_copy
+                            ):
+                                synced += await self._ensure_local_copy(
+                                    cfg,
+                                    pending_copy,
+                                    offline_target,
+                                    cd2_local_dest,
+                                    local_base,
+                                )
+                            synced += await self._sync_selected_torrents(
+                                client, cfg, pending_sync
+                            )
+                finally:
+                    self._session = None
+
+            ok = submitted > 0 or synced > 0
+            msg_en = (
                 f"Submitted {submitted}, synced {synced}, "
                 f"skipped {skipped}, failed {failed}."
-            ),
-            "msg_zh": (
+            )
+            msg_zh = (
                 f"已提交 {submitted} 个，同步 {synced} 个，"
                 f"跳过 {skipped} 个，失败 {failed} 个。"
-            ),
-        }
+            )
+            if cooled:
+                msg_en += f" {len(cooled)} were just sent."
+                msg_zh += f"其中 {len(cooled)} 个刚刚发送过。"
+            return {
+                "success": ok,
+                "submitted": submitted,
+                "synced": synced,
+                "skipped": skipped,
+                "failed": failed,
+                "msg_en": msg_en,
+                "msg_zh": msg_zh,
+            }
+        finally:
+            release_manual_repairs(set(accepted) - keep_cooldown)
+            finish_manual_repairs(keep_cooldown)
 
     async def _submit_torrent(
         self,
@@ -592,14 +619,8 @@ class CD2FallbackManager:
         name = torrent.get("name", torrent_hash[:8])
         norm_hash = normalize_info_hash(torrent_hash)
         offline_item = (offline_tasks or {}).get(norm_hash)
-        force_redownload = force
 
-        if force and force_redownload:
-            logger.info(
-                "[CD2] Manual repair selected, force offline resubmit: %s",
-                name,
-            )
-        elif force and self._qb_content_complete(torrent):
+        if force and self._qb_content_complete(torrent):
             logger.info("[CD2] qB local content is ready, force recheck: %s", name)
             await self._recheck_and_resume(client, torrent_hash, cfg)
             await self._clear_cd2_submitted(client, torrent_hash)
@@ -623,57 +644,23 @@ class CD2FallbackManager:
             logger.error("[CD2] offline_dir is not configured: %s", name)
             return "failed"
 
-        if force and not force_redownload and not self._staging_content_missing(
-            torrent, cfg
-        ):
-            logger.info("[CD2] Local CD2 staging content is ready, sync pending: %s", name)
-            return "pending_sync"
-
-        if force and not force_redownload:
-            candidate_paths = self._cloud_candidate_paths(
-                offline_target,
-                torrent,
-                offline_item,
-            )
+        if not self._staging_content_missing(torrent, cfg):
             logger.info(
-                "[CD2] Manual repair checking cloud paths for %s: %s",
-                name,
-                candidate_paths,
-            )
-            existing_paths = await self._existing_cloud_paths(
-                offline_target,
-                torrent,
-                offline_item,
-            )
-            if existing_paths:
-                cd2_local_dest = self._cd2_local_dest(cfg)
-                local_base = self._sync_local_base(cfg)
-                if not cd2_local_dest or local_base is None:
-                    logger.error(
-                        "[CD2] Cloud content exists but local copy target is not mapped: %s",
-                        name,
-                    )
-                    return "failed"
-                if await self._session.copy_cloud_files_to_local(
-                    existing_paths,
-                    cd2_local_dest,
-                ):
-                    logger.info(
-                        "[CD2] Started manual cloud-to-local copy: %s -> %s",
-                        name,
-                        cd2_local_dest,
-                    )
-                    return "copy_started"
-                logger.error("[CD2] Failed to start manual cloud-to-local copy: %s", name)
-                return "failed"
-            logger.info(
-                "[CD2] Manual repair found no existing cloud content, submit offline: %s",
+                "[CD2] Local staging already has %s, skip offline",
                 name,
             )
+            return "pending_sync" if force else "skipped_offline"
 
-        if not force and not await self._needs_redownload(torrent, cfg, offline_item):
-            logger.info("[CD2] Content already available, skip offline submit: %s", name)
-            return "skipped_offline"
+        # 115 的离线任务和网盘文件是分开的：删掉文件，任务还在。
+        # 文件还在就只复制。再 AddOffline 会在同一文件夹里生成「视频A（1）」，
+        # 随后的复制会把整个文件夹拉下来。
+        existing_paths = await self._existing_cloud_paths(
+            offline_target,
+            torrent,
+            offline_item,
+        )
+        if existing_paths:
+            return await self._copy_cloud_only(cfg, name, existing_paths)
 
         try:
             magnet = torrent_to_magnet(torrent)
@@ -684,41 +671,66 @@ class CD2FallbackManager:
         if cfg.pause_qb_torrent and torrent_hash:
             await client.pause_torrent(torrent_hash)
 
+        if offline_item:
+            # 任务还在、文件已经被删：重启原任务，不要新建离线。
+            if await self._session.restart_offline_magnet(
+                offline_target,
+                norm_hash,
+                magnet,
+                offline_item,
+            ):
+                await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
+                logger.info(
+                    "[CD2] Offline task remains but 115 files are gone, restarted task: %s",
+                    name,
+                )
+                return "submitted"
+            logger.error("[CD2] Failed to restart existing offline task: %s", name)
+            if cfg.pause_qb_torrent and torrent_hash:
+                await client.resume_torrent(torrent_hash)
+            return "failed"
+
         try:
-            if force:
-                ok = await self._resubmit_offline(
-                    cfg,
-                    torrent,
-                    magnet,
-                    offline_target,
-                    offline_item,
-                )
-            elif offline_item:
-                ok = await self._restart_or_resubmit_offline(
-                    cfg, torrent, magnet, offline_target, offline_item
-                )
-            else:
-                result = await self._session.add_offline_magnet(
-                    magnet,
-                    offline_target,
-                )
-                if result == "ok":
-                    ok = True
-                elif result == "duplicate":
-                    logger.info(
-                        "[CD2] Offline task already exists, skip recreate: %s",
-                        name,
-                    )
-                    ok = True
-                else:
-                    ok = False
+            result = await self._session.add_offline_magnet(
+                magnet,
+                offline_target,
+            )
         except OfflineLocalFsNotSupportedError as e:
             logger.error("[CD2] Offline submit rejected for local path: %s", e)
             if cfg.pause_qb_torrent and torrent_hash:
                 await client.resume_torrent(torrent_hash)
             return "failed"
 
-        if not ok:
+        if result == "duplicate":
+            # 列表没对上，但 115 说任务已存在。再按文件有没有决定复制还是重启。
+            duplicate_paths = await self._existing_cloud_paths(
+                offline_target,
+                torrent,
+                offline_item,
+            )
+            if duplicate_paths:
+                return await self._copy_cloud_only(cfg, name, duplicate_paths)
+            if await self._session.restart_offline_magnet(
+                offline_target,
+                norm_hash,
+                magnet,
+                offline_item,
+            ):
+                await client.add_tag(torrent_hash, CD2_SUBMITTED_TAG)
+                logger.info(
+                    "[CD2] Existing offline task reported as duplicate, files missing, restarted: %s",
+                    name,
+                )
+                return "submitted"
+            logger.error(
+                "[CD2] Offline task already exists and restart failed: %s",
+                name,
+            )
+            if cfg.pause_qb_torrent and torrent_hash:
+                await client.resume_torrent(torrent_hash)
+            return "failed"
+
+        if result != "ok":
             logger.error("[CD2] Failed to submit offline task: %s", name)
             if cfg.pause_qb_torrent and torrent_hash:
                 await client.resume_torrent(torrent_hash)

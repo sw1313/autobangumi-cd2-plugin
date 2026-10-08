@@ -9,8 +9,11 @@ from cd2.client import is_duplicate_offline_error, normalize_info_hash
 from cd2.config import migrate_cd2_config
 from cd2.fallback import (
     CD2FallbackManager,
+    claim_manual_repairs,
+    finish_manual_repairs,
     is_complete_torrent,
     is_dead_torrent,
+    release_manual_repairs,
 )
 from cd2.sync import (
     completed_copy_task_keys,
@@ -490,6 +493,48 @@ class TestLocalDownloadComplete:
         (root / "sub").mkdir()
         (root / "sub" / "b.mkv").write_bytes(b"67890")
         assert local_content_size(root) == 10
+
+
+class TestManualRepairCooldown:
+    def setup_method(self):
+        release_manual_repairs({"abc", "def"})
+        finish_manual_repairs({"abc", "def"})
+
+    def test_same_hash_within_5s_is_cooled(self):
+        accepted, cooled = claim_manual_repairs({"abc"}, now=100)
+        assert accepted == {"abc"}
+        assert cooled == set()
+        finish_manual_repairs({"abc"})
+
+        accepted, cooled = claim_manual_repairs({"abc", "def"}, now=104)
+        assert accepted == {"def"}
+        assert cooled == {"abc"}
+        finish_manual_repairs(accepted)
+
+    def test_same_hash_after_5s_is_accepted(self):
+        claim_manual_repairs({"abc"}, now=100)
+        finish_manual_repairs({"abc"})
+
+        accepted, cooled = claim_manual_repairs({"abc"}, now=105)
+        assert accepted == {"abc"}
+        assert cooled == set()
+        finish_manual_repairs(accepted)
+
+    def test_inflight_hash_stays_blocked_past_5s(self):
+        claim_manual_repairs({"abc"}, now=100)
+        accepted, cooled = claim_manual_repairs({"abc"}, now=110)
+        assert accepted == set()
+        assert cooled == {"abc"}
+        finish_manual_repairs({"abc"})
+
+    def test_failed_repair_can_be_sent_again(self):
+        claim_manual_repairs({"abc"}, now=100)
+        release_manual_repairs({"abc"})
+
+        accepted, cooled = claim_manual_repairs({"abc"}, now=101)
+        assert accepted == {"abc"}
+        assert cooled == set()
+        finish_manual_repairs(accepted)
 
 
 class TestOfflineListFailure:
