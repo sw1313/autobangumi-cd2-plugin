@@ -19,3 +19,7 @@ overlay/extensions/cd2/cd2/
 overlay/extensions/cd2/backend/cd2/player_api.py
 overlay/webui/src/extensions/player/
 overlay/webui/src/local-extensions.ts
+
+# Runtime files that must stay out of the repository.
+backend/config/
+**/.jwt_secret

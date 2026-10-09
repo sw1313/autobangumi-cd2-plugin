@@ -1,0 +1,15 @@
+[plugin]
+id = "cd2"
+name = "CloudDrive2"
+version = "1.0.0"
+sdk = ">=0.4,<1"
+entry = "cd2_plugin:Cd2Plugin"
+description = "115 离线下载、完成后复制到本地，并在 qB 交接失败时重试打标签"
+authors = ["sw1313"]
+permissions = ["net.connect", "fs.write"]
+
+[[plugin.ui]]
+slot = "dashboard.widget"
+element = "ab-plugin-cd2-boot"
+entry = "web/ui.js"
+title = { zh-CN = "CloudDrive2", en-US = "CloudDrive2" }
