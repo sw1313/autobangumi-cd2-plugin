@@ -26,6 +26,8 @@ config/plugins/local/cd2
 
 目录名必须是 `cd2`，和 `plugin.toml` 里的 id 一致。重启容器后，在插件设置里填写地址、账号和路径。
 
+CloudDrive2 的客户端依赖 `grpcio`。4.x 镜像是 Alpine，不带这个库，主程序也不会在加载插件时执行 pip。容器启动脚本 `entrypoint.4.0.sh` 会在每次启动时检查能否 `import grpc`，不能就用镜像里的 `uv` 装进当前 Python，并在 Alpine 上补上 `libstdc++`。不要把这些轮子放进插件目录：4.0 扫到 `.so` 会拒绝加载整个插件。升级镜像后 `/app` 里的包装会丢，下次启动会再装一次。
+
 ```yaml
 volumes:
   - /path/to/this-repo:/app/config/plugins/local/cd2

@@ -59,7 +59,12 @@ function ensureTest(host) {
     if (!title.textContent.includes("CloudDrive2")) continue;
     let card = title;
     for (let depth = 0; depth < 8 && card; depth += 1) {
-      const save = card.querySelector?.(":scope > .plugin__options .plugin__save, .plugin__save");
+      const saveBox = card.querySelector?.(
+        ":scope > .plugin__options .plugin__save, .plugin__save"
+      );
+      const save = saveBox?.matches?.("button")
+        ? saveBox
+        : saveBox?.querySelector("button");
       if (save && card.querySelector(".plugin__title") === title) {
         if (card.querySelector("[data-cd2-test]")) return;
         const button = document.createElement("button");
