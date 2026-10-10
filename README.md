@@ -28,7 +28,7 @@ config/plugins/local/cd2
 
 CloudDrive2 本体在单独的容器或群晖套件里。这个插件只是连过去的 gRPC 客户端。4.x 镜像不带 `grpcio`，插件目录里也不能放 `.so`，宿主扫到会拒绝加载整个插件。
 
-插件启动时如果当前 Python 还不能导入客户端，会把库下载到配置目录的 `cd2-runtime`。这个目录在插件外面，加载检查扫不到，也跟着配置卷保留。Alpine 上如果没有 `libstdc++`，需要的系统库同样放在这里。仓库放到 `config/plugins/local/cd2` 后重启就会自己装好。
+插件启动时如果当前 Python 还不能导入客户端，会把 musl 版轮子下载到配置目录的 `cd2-runtime`。这个目录在插件外面，加载检查扫不到，也跟着配置卷保留。官方镜像没有 `libstdc++`，这份 musl 轮子也不依赖它。仓库放到 `config/plugins/local/cd2` 后重启就会自己装好。
 
 ```yaml
 volumes:

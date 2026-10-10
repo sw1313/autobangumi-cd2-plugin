@@ -20,12 +20,10 @@ def _ensure_app_path() -> None:
 
 def _ensure_path() -> None:
     _ensure_app_path()
-    roots = [Path("/extensions/cd2/backend")]
-    try:
-        app_root = Path(__file__).resolve().parents[3]
-        roots.append(app_root / "extensions" / "cd2" / "backend")
-    except IndexError:
-        pass
+    roots = [
+        Path(__file__).resolve().parents[1],
+        Path("/extensions/cd2/backend"),
+    ]
     for root in roots:
         if (root / "cd2" / "__init__.py").is_file():
             root_str = str(root)

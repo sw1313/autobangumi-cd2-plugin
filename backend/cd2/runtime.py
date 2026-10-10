@@ -7,9 +7,6 @@ copy of this repository can install them on startup without shipping wheels.
 
 from __future__ import annotations
 
-import ctypes
-import gzip
-import io
 import json
 import logging
 import os
@@ -17,7 +14,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import tarfile
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -25,7 +21,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _PACKAGES = ("grpcio", "protobuf", "typing_extensions", "clouddrive2-client")
-_ALPINE_LIBS = ("libgcc_s.so.1", "libstdc++.so.6")
 
 
 def plugin_root() -> Path:
@@ -49,18 +44,8 @@ def _python_dir() -> Path:
     return runtime_home() / "py"
 
 
-def _lib_dir() -> Path:
-    return runtime_home() / "lib"
-
-
 def activate() -> None:
     """Make a previously installed runtime visible to this process."""
-    lib_dir = _lib_dir()
-    if lib_dir.is_dir():
-        for name in _ALPINE_LIBS:
-            path = lib_dir / name
-            if path.is_file():
-                ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
     py_dir = _python_dir()
     if (py_dir / "grpc").is_dir() and str(py_dir) not in sys.path:
         sys.path.insert(0, str(py_dir))
@@ -85,98 +70,6 @@ def _arch() -> str:
 
 def _musl() -> bool:
     return os.path.exists(f"/lib/ld-musl-{_arch()}.so.1")
-
-
-def _alpine_version() -> str | None:
-    path = Path("/etc/os-release")
-    if not path.is_file():
-        return None
-    values = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key] = value.strip().strip('"')
-    if values.get("ID") != "alpine":
-        return None
-    version = values.get("VERSION_ID", "")
-    parts = version.split(".")
-    if len(parts) < 2:
-        return None
-    return f"v{parts[0]}.{parts[1]}"
-
-
-def _needs_libstdcxx() -> bool:
-    if not _musl() or os.path.exists("/usr/lib/libstdc++.so.6"):
-        return False
-    return not all((_lib_dir() / name).is_file() for name in _ALPINE_LIBS)
-
-
-def _apk_names(version: str, arch: str) -> dict[str, str]:
-    url = f"https://dl-cdn.alpinelinux.org/alpine/{version}/main/{arch}/APKINDEX.tar.gz"
-    with urllib.request.urlopen(url, timeout=60) as response:
-        blob = response.read()
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as archive:
-        text = archive.extractfile("APKINDEX").read().decode()
-    wanted = {"libgcc": "", "libstdc++": ""}
-    current: dict[str, str] = {}
-    for line in text.splitlines() + [""]:
-        if line == "":
-            name = current.get("P")
-            if name in wanted and current.get("V"):
-                wanted[name] = f"{name}-{current['V']}.apk"
-            current = {}
-            continue
-        if ":" in line:
-            key, value = line.split(":", 1)
-            current[key] = value
-    missing = [name for name, filename in wanted.items() if not filename]
-    if missing:
-        raise RuntimeError(f"Alpine index has no package for {', '.join(missing)}")
-    return wanted
-
-
-def _extract_apk(blob: bytes, dest: Path) -> None:
-    pos = 0
-    while True:
-        start = blob.find(b"\x1f\x8b", pos)
-        if start < 0:
-            return
-        try:
-            with gzip.GzipFile(fileobj=io.BytesIO(blob[start:])) as handle:
-                payload = handle.read()
-            archive = tarfile.open(fileobj=io.BytesIO(payload))
-        except (OSError, tarfile.TarError, EOFError):
-            pos = start + 2
-            continue
-        for member in archive.getmembers():
-            base = Path(member.name).name
-            if base not in _ALPINE_LIBS and not base.startswith("libstdc++.so.6."):
-                continue
-            source = archive.extractfile(member)
-            if source is None:
-                continue
-            filename = "libstdc++.so.6" if "libstdc++" in base else base
-            (dest / filename).write_bytes(source.read())
-        pos = start + 2
-
-
-def _install_alpine_libs() -> None:
-    if not _needs_libstdcxx():
-        return
-    version = _alpine_version()
-    if version is None:
-        raise RuntimeError("libstdc++ is missing and this is not Alpine")
-    dest = _lib_dir()
-    dest.mkdir(parents=True, exist_ok=True)
-    arch = _arch()
-    for filename in _apk_names(version, arch).values():
-        url = f"https://dl-cdn.alpinelinux.org/alpine/{version}/main/{arch}/{filename}"
-        logger.info("CD2 正在下载 %s", filename)
-        with urllib.request.urlopen(url, timeout=60) as response:
-            _extract_apk(response.read(), dest)
-    if _needs_libstdcxx():
-        raise RuntimeError("Alpine libstdc++ was downloaded but the libraries are missing")
 
 
 def _wheel_url(package: str, py_tag: str, arch: str, musl: bool) -> str:
@@ -259,7 +152,6 @@ def ensure() -> None:
     home = runtime_home()
     logger.info("CD2 客户端库未安装，正在下载到 %s", home)
     try:
-        _install_alpine_libs()
         try:
             installed = _uv_install()
         except (OSError, subprocess.CalledProcessError):
