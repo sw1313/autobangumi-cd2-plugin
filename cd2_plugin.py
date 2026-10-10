@@ -50,6 +50,9 @@ class Cd2Plugin(Plugin[Cd2Options]):
         backend = str(Path(__file__).resolve().parent / "backend")
         if backend not in sys.path:
             sys.path.insert(0, backend)
+        from cd2.runtime import ensure
+
+        ensure()
         from cd2.bootstrap import _install_page_script, install
         from cd2.config import attach_cd2_settings, load_cd2_dict, save_cd2_dict
         from module.conf import settings

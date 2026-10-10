@@ -6,6 +6,10 @@ import time
 from collections.abc import Iterator
 from typing import Callable
 
+from cd2.runtime import activate
+
+activate()
+
 import grpc
 from google.protobuf import empty_pb2
 
